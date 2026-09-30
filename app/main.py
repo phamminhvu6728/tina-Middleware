@@ -1,8 +1,11 @@
+import json
 import logging
 import re
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 from urllib.parse import quote
-from fastapi import FastAPI, BackgroundTasks, UploadFile, File, HTTPException, Query, Request, Response
+
+from fastapi import (BackgroundTasks, FastAPI, File, HTTPException, Query,
+                     Request, Response, UploadFile)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -29,7 +32,7 @@ logger = logging.getLogger("topcv-middleware")
 app = FastAPI(
     title="TopCV & OCR Middleware for Tina CRM",
     description="Standalone microservice for downloading protected CVs from TopCV, OCR/text extraction, and forwarding to Tina CRM.",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 app.add_middleware(
@@ -40,6 +43,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def log_incoming_requests(request: Request, call_next):
+    """
+    Nginx in front of this service may rewrite, prefix or redirect the incoming
+    path, so the raw path is logged to make the routing visible.
+    """
+    logger.info(f"===> INCOMING [{request.method}] path='{request.url.path}' "
+                f"query='{request.url.query}' host='{request.headers.get('host', '')}'")
+    response = await call_next(request)
+    return response
+
+
 cv_store = TempCvStore(
     root=settings.TMP_CV_DIR,
     ttl_seconds=settings.CV_LINK_TTL_SECONDS,
@@ -47,6 +63,30 @@ cv_store = TempCvStore(
 cv_store.start_sweeper()
 
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+_CV_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG", b"GIF8", b"BM", b"II*\x00", b"MM\x00*")
+_HTML_MARKERS = (b"<!doctype html", b"<html", b"<HTML")
+
+
+class TopCVWebhookPayload(BaseModel):
+    candidate_name: Optional[str] = Field(None, description="Tên ứng viên")
+    candidate_email: Optional[str] = Field(None, description="Email ứng viên")
+    candidate_phone: Optional[str] = Field(None, description="Số điện thoại")
+    job_id: Optional[str] = Field(None, description="ID tin tuyển dụng trên TopCV")
+    job_title: Optional[str] = Field(None, description="Tên vị trí tuyển dụng")
+    apply_at: Optional[str] = Field(None, description="Thời gian ứng tuyển")
+    download_url: Optional[str] = Field(None, description="Link onetime-download của TopCV")
+    url: Optional[str] = None
+    cv_download_url: Optional[str] = None
+    cv_url: Optional[str] = None
+    cv_file: Optional[Dict[str, Any]] = None
+    data: Optional[Dict[str, Any]] = None
+    pm_email: Optional[str] = Field(None, description="Email người phụ trách")
+    source: Optional[str] = Field("TOPCV", description="Nguồn ứng viên")
+    cv_text: Optional[str] = Field(None, description="Text CV có sẵn")
+
+    class Config:
+        extra = "allow"
 
 
 def _content_disposition(filename: str) -> str:
@@ -77,14 +117,10 @@ def _resolve_range(range_header: str, size: int):
     return start, end
 
 
-_IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG", b"GIF8", b"BM", b"II*\x00", b"MM\x00*")
-_HTML_MARKERS = (b"<!doctype html", b"<html", b"<HTML")
-
-
 def _reject_soft_blocked(file_bytes: bytes, content_type: str, filename: Optional[str]):
     """
     Cloudflare serves a JS challenge page with HTTP 200, which would otherwise be
-    cached and served as if it were the CV.
+    cached and forwarded to Tina CRM as if it were the CV.
     """
     if not file_bytes:
         raise RuntimeError("Empty response body from download_url")
@@ -123,25 +159,44 @@ def _expires_iso(ttl_seconds: int) -> str:
     tz = timezone(timedelta(hours=7))
     return (datetime.now(tz) + timedelta(seconds=ttl_seconds)).isoformat()
 
-class TopCVWebhookPayload(BaseModel):
-    candidate_name: Optional[str] = Field(None, description="Tên ứng viên")
-    candidate_email: Optional[str] = Field(None, description="Email ứng viên")
-    candidate_phone: Optional[str] = Field(None, description="Số điện thoại")
-    job_id: Optional[str] = Field(None, description="ID tin tuyển dụng trên TopCV")
-    job_title: Optional[str] = Field(None, description="Tên vị trí tuyển dụng")
-    apply_at: Optional[str] = Field(None, description="Thời gian ứng tuyển")
-    download_url: Optional[str] = Field(None, description="Link onetime-download của TopCV")
-    url: Optional[str] = None
-    cv_download_url: Optional[str] = None
-    cv_url: Optional[str] = None
-    cv_file: Optional[Dict[str, Any]] = None
-    data: Optional[Dict[str, Any]] = None
-    pm_email: Optional[str] = Field(None, description="Email người phụ trách")
-    source: Optional[str] = Field("TOPCV", description="Nguồn ứng viên")
-    cv_text: Optional[str] = Field(None, description="Text CV có sẵn")
 
-    class Config:
-        extra = "allow"
+def _serve_cv(cv_id: str, request: Request):
+    found = cv_store.load(cv_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="CV link expired or does not exist")
+
+    data_path, record = found
+    size = int(record.get("size", data_path.stat().st_size))
+    filename = record.get("filename", "cv.pdf")
+    content_type = record.get("content_type", "application/pdf")
+    if "text/" in content_type and filename.lower().endswith(".pdf"):
+        content_type = "application/pdf"
+
+    base_headers = {
+        "Content-Disposition": _content_disposition(filename),
+        "Cache-Control": "private, max-age=60",
+        "Accept-Ranges": "bytes",
+    }
+
+    range_header = request.headers.get("range")
+    if range_header:
+        resolved = _resolve_range(range_header, size)
+        if resolved is None:
+            return Response(
+                status_code=416,
+                headers={"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"},
+            )
+        start, end = resolved
+        with open(data_path, "rb") as fh:
+            fh.seek(start)
+            chunk = fh.read(end - start + 1)
+        headers = dict(base_headers)
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        return Response(content=chunk, status_code=206, media_type=content_type,
+                        headers=headers)
+
+    return FileResponse(path=str(data_path), media_type=content_type, headers=base_headers)
+
 
 def process_and_forward(payload_dict: Dict[str, Any], webhook_url: Optional[str] = None) -> Dict[str, Any]:
     candidate_name = (
@@ -228,6 +283,7 @@ def process_and_forward(payload_dict: Dict[str, Any], webhook_url: Optional[str]
             cv_size = len(file_bytes)
             cv_link_expires_at = _expires_iso(cv_store.ttl_seconds)
             cv_file_url = f"{settings.PUBLIC_BASE_URL.rstrip('/')}/cv/{cv_id}"
+            logger.info(f"Cached CV as {cv_id}, link expires at {cv_link_expires_at}")
         except Exception as e:
             logger.error(f"Failed to download/extract CV: {e}")
             cv_text = f"Lỗi tải hoặc bóc tách CV từ download_url: {e}"
@@ -259,10 +315,15 @@ def process_and_forward(payload_dict: Dict[str, Any], webhook_url: Optional[str]
         "candidate_email": candidate_email,
         "job_title": job_title,
         "cv_text_length": len(cv_text),
-        "cv_file_url": tina_payload.get("cv_file_url"),
+        "cv_file_url": cv_file_url,
         "extraction_method": extraction_method,
         "forward_result": forward_result
     }
+
+
+def _is_ping() -> dict:
+    return {"status": "ok", "message": "TopCV Webhook Endpoint Ready"}
+
 
 @app.get("/health")
 def health_check():
@@ -284,67 +345,29 @@ def health_check():
 
 @app.get("/cv/{cv_id}")
 def get_cv(cv_id: str, request: Request):
-    """
-    Serves a cached CV file. The file is removed once its TTL passes, so this
-    link is deliberately short lived and is not a permanent archive.
-    """
-    found = cv_store.load(cv_id)
-    if not found:
-        raise HTTPException(status_code=404, detail="CV link expired or does not exist")
-
-    data_path, record = found
-    size = int(record.get("size", data_path.stat().st_size))
-    filename = record.get("filename", "cv.pdf")
-    content_type = record.get("content_type", "application/pdf")
-    if "text/" in content_type and filename.lower().endswith(".pdf"):
-        content_type = "application/pdf"
-
-    range_header = request.headers.get("range")
-    base_headers = {
-        "Content-Disposition": _content_disposition(filename),
-        "Cache-Control": "private, max-age=60",
-        "Accept-Ranges": "bytes",
-    }
-
-    if range_header:
-        resolved = _resolve_range(range_header, size)
-        if resolved is None:
-            return Response(
-                status_code=416,
-                headers={"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"},
-            )
-        start, end = resolved
-        with open(data_path, "rb") as fh:
-            fh.seek(start)
-            chunk = fh.read(end - start + 1)
-        headers = dict(base_headers)
-        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-        return Response(
-            content=chunk,
-            status_code=206,
-            media_type=content_type,
-            headers=headers,
-        )
-
-    return FileResponse(
-        path=str(data_path),
-        media_type=content_type,
-        headers=base_headers,
-    )
+    return _serve_cv(cv_id, request)
 
 
 @app.post("/cv/{cv_id}/release", status_code=204)
 def release_cv(cv_id: str):
-    """Deletes a cached CV immediately, once the receiver has fetched it."""
     cv_store.delete(cv_id)
     return Response(status_code=204)
 
+
+@app.get("/webhook/topcv")
+async def topcv_webhook_ping():
+    return _is_ping()
+
+
 @app.post("/webhook/topcv")
 async def topcv_webhook(
-    payload: TopCVWebhookPayload,
+    payload: Optional[TopCVWebhookPayload] = None,
     sync: bool = Query(True, description="Đồng bộ (True) hoặc Bất đồng bộ nền (False)"),
     background_tasks: BackgroundTasks = None
 ):
+    if not payload:
+        return {"status": "ok", "message": "Ping received"}
+
     data = payload.model_dump(exclude_none=True)
     logger.info(f"Received TopCV webhook for candidate: {data.get('candidate_name', 'Unknown')}")
 
@@ -356,8 +379,8 @@ async def topcv_webhook(
             "candidate_name": data.get("candidate_name")
         }
 
-    result = process_and_forward(data)
-    return result
+    return process_and_forward(data)
+
 
 @app.post("/extract-url")
 def extract_from_url(url: str = Query(..., description="URL file CV")):
@@ -376,6 +399,7 @@ def extract_from_url(url: str = Query(..., description="URL file CV")):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/extract-file")
 async def extract_from_file(file: UploadFile = File(...)):
     file_bytes = await file.read()
@@ -388,3 +412,51 @@ async def extract_from_file(file: UploadFile = File(...)):
         "text_preview": text[:500],
         "full_text": text
     }
+
+
+@app.api_route("/{full_path:path}", methods=["GET", "POST"])
+async def catch_all(full_path: str, request: Request, background_tasks: BackgroundTasks):
+    """
+    Catch-all registered last on purpose.
+
+    Nginx in front of this service may redirect or rewrite the path (observed:
+    /webhook/topcv returning 301 to another host, and the request landing under an
+    unexpected prefix). Guessing the path is unreliable, so any path that does not
+    match a real route is treated as a TopCV webhook. The raw path is logged above
+    so the actual routing can be read off the logs.
+    """
+    segments = [s for s in full_path.split("/") if s]
+    if segments and _CV_ID_RE.match(segments[-1]) and cv_store.load(segments[-1]):
+        logger.info(f"Serving cached CV {segments[-1]} via prefix '/{full_path}'")
+        return _serve_cv(segments[-1], request)
+
+    if request.method == "GET":
+        return _is_ping()
+
+    raw = await request.body()
+    if not raw.strip():
+        return {"status": "ok", "message": "Ping received"}
+
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        logger.error(f"Unparseable body on '/{full_path}': {e}")
+        raise HTTPException(status_code=400, detail=f"Body is not valid JSON: {e}")
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400,
+                            detail="Body must be a JSON object")
+
+    logger.info(f"Treating '/{full_path}' as TopCV webhook, "
+                f"keys={sorted(data.keys())[:12]}")
+
+    sync = request.query_params.get("sync", "true").lower()
+    if sync in ("false", "0", "no"):
+        background_tasks.add_task(process_and_forward, data)
+        return {
+            "status": "queued",
+            "message": "Candidate CV processing started in background",
+            "candidate_name": data.get("candidate_name")
+        }
+
+    return process_and_forward(data)

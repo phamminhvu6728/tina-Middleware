@@ -138,6 +138,40 @@ Kiểm tra trạng thái server, engine OCR và cấu hình link CV.
 
 ---
 
+## Định tuyến qua Nginx: nhận mọi path
+
+Quan sát thực tế trên staging:
+
+```
+POST https://app.stg-tinacrm.tinasoft.io/webhook/topcv  -> 404, X-Powered-By: Express  (rơi vào Twenty CRM)
+POST https://stg-tinacrm.tinasoft.io/webhook/topcv      -> 301 sang app.stg-...        (Nginx redirect)
+POST https://stg-tinacrm.tinasoft.io/topcv/webhook/topcv -> 404 {"detail":"Not Found"}  (đã tới FastAPI)
+```
+
+Có hai dấu hiệu để phân biệt ai đang trả lời:
+`{"detail":"Not Found"}` là của **FastAPI** (middleware),
+`{"message":"Cannot POST ...","statusCode":404}` là của **Express** (Twenty CRM).
+
+Vì Nginx có thể thêm prefix, đổi tên hoặc redirect, middleware **không đoán path**.
+Ngoài các route thật, có một catch-all đăng ký cuối cùng:
+
+- `GET` bất kỳ path nào → trả `{"status":"ok"}` để TopCV ping kết nối được.
+- `POST` bất kỳ path nào → coi như webhook TopCV và xử lý.
+- `GET` có path segment cuối là id 32 hex đã cache → trả file CV đó.
+
+Nhờ vậy không cần biết Nginx đang truyền path nào. Mọi request đều log ở dạng
+`INCOMING [POST] path='...'` để đối chiếu.
+
+Lưu ý: `POST /webhook/topcv` khai báo typed sẽ trả `422` nếu body sai JSON, còn
+catch-all trả `400`. Cả hai đều chấp nhận `POST` rỗng làm ping.
+
+### `PUBLIC_BASE_URL` phải trỏ tới path tới được middleware
+
+Link CV được ghép thành `{PUBLIC_BASE_URL}/cv/{id}`. Nếu path gốc (`/cv/...`) bị
+Nginx redirect sang Twenty thì link sẽ chết. Khi đó đặt `PUBLIC_BASE_URL` kèm
+prefix, ví dụ `https://stg-tinacrm.tinasoft.io/topcv` — catch-all sẽ phục vụ file
+dưới prefix đó. Kiểm tra bằng cách gọi `/health` rồi thử tải một link CV thật.
+
 ## Link tải CV trong payload webhook
 
 Link TopCV dạng `onetime-download` **hết hạn sau 24 giờ** (JWT `exp` trong token).
