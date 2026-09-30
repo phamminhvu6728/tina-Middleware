@@ -13,6 +13,8 @@ class Settings(BaseModel):
     FORWARD_TIMEOUT_SECONDS: int = int(os.getenv("FORWARD_TIMEOUT_SECONDS", "30"))
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
     TMP_CV_DIR: str = os.getenv("TMP_CV_DIR", "/tmp/tina-middleware-cv")
-    CV_LINK_TTL_SECONDS: int = int(os.getenv("CV_LINK_TTL_SECONDS", "3600"))
+    CV_LINK_TTL_SECONDS: int = int(os.getenv("CV_LINK_TTL_SECONDS", "60"))
+    CV_MAX_CACHED_FILES: int = int(os.getenv("CV_MAX_CACHED_FILES", "10"))
+    CV_MAX_WORKERS: int = int(os.getenv("CV_MAX_WORKERS", "10"))
 
 settings = Settings()

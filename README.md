@@ -25,10 +25,15 @@ TINA_WEBHOOK_URL=http://<IP_HOAC_DOMAIN_TINA_CRM>:3000/webhooks/workflows/5b8996
 DEFAULT_PM_EMAIL=tuyendung@tinasoft.vn
 DOWNLOAD_TIMEOUT_SECONDS=30
 FORWARD_TIMEOUT_SECONDS=30
-PUBLIC_BASE_URL=http://topcv-ocr-middleware:8000
+PUBLIC_BASE_URL=
 TMP_CV_DIR=/var/lib/tina-middleware-cv
-CV_LINK_TTL_SECONDS=3600
+CV_LINK_TTL_SECONDS=60
+CV_MAX_CACHED_FILES=10
+CV_MAX_WORKERS=10
 ```
+
+`PUBLIC_BASE_URL` để trống là middleware tự suy ra public base URL từ request (xem
+phần [`PUBLIC_BASE_URL` tự suy ra](#public_base_url-tự-suy-ra-không-cần-cấu-hình)).
 
 ### Bắt buộc: network chung `tina-shared`
 
@@ -45,8 +50,10 @@ networks:
   tina-shared:
     external: true
 ```
-Nếu Twenty chạy ngoài docker (VPS riêng), đổi `PUBLIC_BASE_URL` thành URL public
-thật, ví dụ `https://cv.tinasoft.vn`.
+Nếu Twenty chạy ngoài docker (VPS riêng) thì network chung không dùng được, nhưng
+không sao: `PUBLIC_BASE_URL` để trống thì link tự suy ra từ request, vẫn public
+và gọi được. Network chung chỉ cần khi Twenty muốn gọi vào middleware bằng tên
+service docker.
 
 Nếu Twenty gọi bằng địa chỉ IP container cứng (`172.19.0.2`) thì đừng làm vậy —
 IP đổi mỗi lần recreate container. Luôn dùng tên service.
@@ -118,11 +125,12 @@ Endpoint chính nhận webhook từ TopCV.
 ```
 
 ### 2. `GET /cv/{cv_id}`
-Tải file CV đã được cache. Link **có thời hạn ngắn** (`CV_LINK_TTL_SECONDS`,
-mặc định 1 giờ), sau đó file tự bị xóa và link trả `404`. Đây không phải kho lưu
-trữ lâu dài.
+Tải file CV đã được cache. Link **dùng một lần**: lần tải trọn vẹn đầu tiên sẽ xóa
+file ngay, lần sau trả `404`. Ngoài ra file tự bị xóa sau `CV_LINK_TTL_SECONDS`
+(mặc định **60 giây**) nếu chưa ai tải. Đây không phải kho lưu trữ lâu dài.
 
-Hỗ trợ `Range` request nên trình duyệt xem trước PDF không bị lỗi.
+Request `Range` **không** tiêu thụ link, vì trình xem PDF gửi nhiều request `Range`
+liên tiếp cho một tài liệu; nếu xóa ngay ở request đầu thì phần còn lại sẽ `404`.
 
 ### 3. `POST /cv/{cv_id}/release`
 Xóa file ngay lập tức, dùng khi bên nhận đã tải xong và muốn dọn file sớm.

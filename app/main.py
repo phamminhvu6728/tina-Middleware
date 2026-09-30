@@ -1,13 +1,13 @@
 import json
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
 from fastapi import (BackgroundTasks, FastAPI, File, HTTPException, Query,
                      Request, Response, UploadFile)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 try:
@@ -59,8 +59,15 @@ async def log_incoming_requests(request: Request, call_next):
 cv_store = TempCvStore(
     root=settings.TMP_CV_DIR,
     ttl_seconds=settings.CV_LINK_TTL_SECONDS,
+    max_files=settings.CV_MAX_CACHED_FILES,
 )
 cv_store.start_sweeper()
+
+# Bounded worker pool: OCR and download are CPU/network heavy, so at most
+# CV_MAX_WORKERS candidates are processed at a time. Anything beyond that waits
+# in the queue instead of piling up threads and memory.
+_job_pool = ThreadPoolExecutor(max_workers=settings.CV_MAX_WORKERS,
+                               thread_name_prefix="cv-job")
 
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 _CV_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -198,12 +205,21 @@ def _expires_iso(ttl_seconds: int) -> str:
 
 
 def _serve_cv(cv_id: str, request: Request):
-    found = cv_store.load(cv_id)
-    if not found:
-        raise HTTPException(status_code=404, detail="CV link expired or does not exist")
+    """
+    Serve a cached CV.
 
-    data_path, record = found
-    size = int(record.get("size", data_path.stat().st_size))
+    The link is single use: a full download consumes it and the file is deleted
+    immediately. Range requests deliberately do not consume, because a PDF
+    viewer issues several of them for a single document and deleting on the
+    first one would break the preview.
+    """
+    range_header = request.headers.get("range")
+    found = cv_store.load(cv_id, consume=not range_header)
+    if not found:
+        raise HTTPException(status_code=404, detail="CV link expired or already used")
+
+    data, record = found
+    size = len(data)
     filename = record.get("filename", "cv.pdf")
     content_type = record.get("content_type", "application/pdf")
     if "text/" in content_type and filename.lower().endswith(".pdf"):
@@ -211,11 +227,10 @@ def _serve_cv(cv_id: str, request: Request):
 
     base_headers = {
         "Content-Disposition": _content_disposition(filename),
-        "Cache-Control": "private, max-age=60",
+        "Cache-Control": "no-store",
         "Accept-Ranges": "bytes",
     }
 
-    range_header = request.headers.get("range")
     if range_header:
         resolved = _resolve_range(range_header, size)
         if resolved is None:
@@ -224,15 +239,12 @@ def _serve_cv(cv_id: str, request: Request):
                 headers={"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"},
             )
         start, end = resolved
-        with open(data_path, "rb") as fh:
-            fh.seek(start)
-            chunk = fh.read(end - start + 1)
         headers = dict(base_headers)
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-        return Response(content=chunk, status_code=206, media_type=content_type,
-                        headers=headers)
+        return Response(content=data[start:end + 1], status_code=206,
+                        media_type=content_type, headers=headers)
 
-    return FileResponse(path=str(data_path), media_type=content_type, headers=base_headers)
+    return Response(content=data, media_type=content_type, headers=base_headers)
 
 
 def process_and_forward(payload_dict: Dict[str, Any], webhook_url: Optional[str] = None,
@@ -360,6 +372,10 @@ def process_and_forward(payload_dict: Dict[str, Any], webhook_url: Optional[str]
         "job_title": job_title,
         "cv_text_length": len(cv_text),
         "cv_file_url": cv_file_url,
+        "cv_filename": cv_filename,
+        "cv_size": cv_size,
+        "cv_link_expires_at": cv_link_expires_at,
+        "cv_link_single_use": True,
         "extraction_method": extraction_method,
         "forward_result": forward_result
     }
@@ -378,6 +394,10 @@ def health_check():
         "cv_link": {
             "public_base_url": settings.PUBLIC_BASE_URL or "(auto from request)",
             "ttl_seconds": settings.CV_LINK_TTL_SECONDS,
+            "max_cached_files": settings.CV_MAX_CACHED_FILES,
+            "cached_files": cv_store.count(),
+            "max_workers": settings.CV_MAX_WORKERS,
+            "single_use": True,
             "cache_dir": settings.TMP_CV_DIR
         },
         "ocr_engines": {
@@ -403,11 +423,28 @@ async def topcv_webhook_ping():
     return _is_ping()
 
 
+def _submit(data: Dict[str, Any], base_url: str) -> Dict[str, Any]:
+    """
+    Queue the job on the bounded pool and hand the webhook caller straight back.
+
+    TopCV and the browser both give up on a slow webhook, so the expensive work
+    (download, OCR, cache, forward) runs on the pool while this returns 200 now.
+    """
+    _job_pool.submit(process_and_forward, data, None, base_url)
+    return {
+        "status": "queued",
+        "message": "Candidate CV queued for processing",
+        "candidate_name": data.get("candidate_name"),
+        "cv_link_ttl_seconds": settings.CV_LINK_TTL_SECONDS,
+        "queue_workers": settings.CV_MAX_WORKERS,
+    }
+
+
 @app.post("/webhook/topcv")
 async def topcv_webhook(
     request: Request,
     payload: Optional[TopCVWebhookPayload] = None,
-    sync: bool = Query(True, description="Đồng bộ (True) hoặc Bất đồng bộ nền (False)"),
+    sync: bool = Query(False, description="Bất đồng bộ (mặc định) hoặc đồng bộ để debug"),
     background_tasks: BackgroundTasks = None
 ):
     if not payload:
@@ -419,12 +456,7 @@ async def topcv_webhook(
                 f"(public_base_url={base_url or 'UNRESOLVED'})")
 
     if not sync:
-        background_tasks.add_task(process_and_forward, data, None, base_url)
-        return {
-            "status": "queued",
-            "message": "Candidate CV processing started in background",
-            "candidate_name": data.get("candidate_name")
-        }
+        return _submit(data, base_url)
 
     return process_and_forward(data, None, base_url)
 
@@ -473,11 +505,15 @@ async def catch_all(full_path: str, request: Request, background_tasks: Backgrou
     so the actual routing can be read off the logs.
     """
     segments = [s for s in full_path.split("/") if s]
-    if segments and _CV_ID_RE.match(segments[-1]) and cv_store.load(segments[-1]):
+    if segments and _CV_ID_RE.match(segments[-1]) and cv_store.exists(segments[-1]):
         logger.info(f"Serving cached CV {segments[-1]} via prefix '/{full_path}'")
         return _serve_cv(segments[-1], request)
 
     if request.method == "GET":
+        # A CV shaped path that no longer resolves means the link was used or
+        # expired, so say so instead of answering a misleading health check.
+        if len(segments) >= 2 and segments[-2] == "cv" and _CV_ID_RE.match(segments[-1]):
+            raise HTTPException(status_code=404, detail="CV link expired or already used")
         return _is_ping()
 
     raw = await request.body()
@@ -500,13 +536,8 @@ async def catch_all(full_path: str, request: Request, background_tasks: Backgrou
     base_url = _resolve_public_base_url(request)
     logger.info(f"public_base_url={base_url or 'UNRESOLVED'}")
 
-    sync = request.query_params.get("sync", "true").lower()
+    sync = request.query_params.get("sync", "false").lower()
     if sync in ("false", "0", "no"):
-        background_tasks.add_task(process_and_forward, data, None, base_url)
-        return {
-            "status": "queued",
-            "message": "Candidate CV processing started in background",
-            "candidate_name": data.get("candidate_name")
-        }
+        return _submit(data, base_url)
 
     return process_and_forward(data, None, base_url)
