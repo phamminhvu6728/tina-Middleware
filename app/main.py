@@ -66,6 +66,7 @@ _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 _CV_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG", b"GIF8", b"BM", b"II*\x00", b"MM\x00*")
 _HTML_MARKERS = (b"<!doctype html", b"<html", b"<HTML")
+_WEBHOOK_PATH_SUFFIXES = ("/webhook/topcv",)
 
 
 class TopCVWebhookPayload(BaseModel):
@@ -87,6 +88,42 @@ class TopCVWebhookPayload(BaseModel):
 
     class Config:
         extra = "allow"
+
+
+def _resolve_public_base_url(request: Optional[Request]) -> str:
+    """
+    Builds the public base URL that the CV download link is built from.
+
+    PUBLIC_BASE_URL wins when set. Otherwise the value is derived from the
+    incoming request, so the same image produces correct links on staging and
+    production without environment specific configuration. Nginx terminates TLS
+    and may mount the service under a prefix, so the scheme, host and prefix are
+    all taken from the request rather than assumed.
+    """
+    if settings.PUBLIC_BASE_URL:
+        return settings.PUBLIC_BASE_URL.rstrip("/")
+
+    if request is None:
+        return ""
+
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    if not proto:
+        proto = request.url.scheme or "http"
+
+    host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+    if not host:
+        host = request.headers.get("host", "")
+
+    prefix = request.headers.get("x-forwarded-prefix", "").split(",")[0].strip()
+    if not prefix:
+        path = request.url.path or ""
+        for suffix in _WEBHOOK_PATH_SUFFIXES:
+            if path.endswith(suffix):
+                prefix = path[: -len(suffix)]
+                break
+
+    prefix = "/" + prefix.strip("/") if prefix.strip("/") else ""
+    return f"{proto}://{host}{prefix}".rstrip("/")
 
 
 def _content_disposition(filename: str) -> str:
@@ -198,7 +235,8 @@ def _serve_cv(cv_id: str, request: Request):
     return FileResponse(path=str(data_path), media_type=content_type, headers=base_headers)
 
 
-def process_and_forward(payload_dict: Dict[str, Any], webhook_url: Optional[str] = None) -> Dict[str, Any]:
+def process_and_forward(payload_dict: Dict[str, Any], webhook_url: Optional[str] = None,
+                        public_base_url: Optional[str] = None) -> Dict[str, Any]:
     candidate_name = (
         payload_dict.get("candidate_name") or
         payload_dict.get("name") or
@@ -259,6 +297,7 @@ def process_and_forward(payload_dict: Dict[str, Any], webhook_url: Optional[str]
     cv_filename = ""
     cv_size = 0
     cv_link_expires_at = ""
+    base_url = (public_base_url or _resolve_public_base_url(None)).rstrip("/")
 
     if not cv_text and download_url:
         try:
@@ -282,8 +321,13 @@ def process_and_forward(payload_dict: Dict[str, Any], webhook_url: Optional[str]
             cv_filename = safe_name
             cv_size = len(file_bytes)
             cv_link_expires_at = _expires_iso(cv_store.ttl_seconds)
-            cv_file_url = f"{settings.PUBLIC_BASE_URL.rstrip('/')}/cv/{cv_id}"
-            logger.info(f"Cached CV as {cv_id}, link expires at {cv_link_expires_at}")
+            cv_file_url = f"{base_url}/cv/{cv_id}" if base_url else ""
+            if cv_file_url:
+                logger.info(f"Cached CV as {cv_id}, public link {cv_file_url} "
+                            f"expires at {cv_link_expires_at}")
+            else:
+                logger.warning("cv_file_url left empty: could not determine a public "
+                               "base URL. Set PUBLIC_BASE_URL for this environment.")
         except Exception as e:
             logger.error(f"Failed to download/extract CV: {e}")
             cv_text = f"Lỗi tải hoặc bóc tách CV từ download_url: {e}"
@@ -332,7 +376,7 @@ def health_check():
         "service": "topcv-ocr-middleware",
         "tina_webhook_target": settings.TINA_WEBHOOK_URL,
         "cv_link": {
-            "public_base_url": settings.PUBLIC_BASE_URL,
+            "public_base_url": settings.PUBLIC_BASE_URL or "(auto from request)",
             "ttl_seconds": settings.CV_LINK_TTL_SECONDS,
             "cache_dir": settings.TMP_CV_DIR
         },
@@ -361,6 +405,7 @@ async def topcv_webhook_ping():
 
 @app.post("/webhook/topcv")
 async def topcv_webhook(
+    request: Request,
     payload: Optional[TopCVWebhookPayload] = None,
     sync: bool = Query(True, description="Đồng bộ (True) hoặc Bất đồng bộ nền (False)"),
     background_tasks: BackgroundTasks = None
@@ -369,17 +414,19 @@ async def topcv_webhook(
         return {"status": "ok", "message": "Ping received"}
 
     data = payload.model_dump(exclude_none=True)
-    logger.info(f"Received TopCV webhook for candidate: {data.get('candidate_name', 'Unknown')}")
+    base_url = _resolve_public_base_url(request)
+    logger.info(f"Received TopCV webhook for candidate: {data.get('candidate_name', 'Unknown')} "
+                f"(public_base_url={base_url or 'UNRESOLVED'})")
 
     if not sync:
-        background_tasks.add_task(process_and_forward, data)
+        background_tasks.add_task(process_and_forward, data, None, base_url)
         return {
             "status": "queued",
             "message": "Candidate CV processing started in background",
             "candidate_name": data.get("candidate_name")
         }
 
-    return process_and_forward(data)
+    return process_and_forward(data, None, base_url)
 
 
 @app.post("/extract-url")
@@ -450,13 +497,16 @@ async def catch_all(full_path: str, request: Request, background_tasks: Backgrou
     logger.info(f"Treating '/{full_path}' as TopCV webhook, "
                 f"keys={sorted(data.keys())[:12]}")
 
+    base_url = _resolve_public_base_url(request)
+    logger.info(f"public_base_url={base_url or 'UNRESOLVED'}")
+
     sync = request.query_params.get("sync", "true").lower()
     if sync in ("false", "0", "no"):
-        background_tasks.add_task(process_and_forward, data)
+        background_tasks.add_task(process_and_forward, data, None, base_url)
         return {
             "status": "queued",
             "message": "Candidate CV processing started in background",
             "candidate_name": data.get("candidate_name")
         }
 
-    return process_and_forward(data)
+    return process_and_forward(data, None, base_url)

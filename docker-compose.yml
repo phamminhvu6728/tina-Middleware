@@ -10,7 +10,9 @@ services:
     environment:
       - PORT=8000
       - HOST=0.0.0.0
-      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://topcv-ocr-middleware:8000}
+      # Để trống để middleware tự suy ra public base URL từ X-Forwarded-* của Nginx.
+      # Chỉ đặt khi muốn ép một domain cụ thể.
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - TMP_CV_DIR=/var/lib/tina-middleware-cv
       - CV_LINK_TTL_SECONDS=${CV_LINK_TTL_SECONDS:-3600}
     volumes:

@@ -165,12 +165,32 @@ Nhờ vậy không cần biết Nginx đang truyền path nào. Mọi request đ
 Lưu ý: `POST /webhook/topcv` khai báo typed sẽ trả `422` nếu body sai JSON, còn
 catch-all trả `400`. Cả hai đều chấp nhận `POST` rỗng làm ping.
 
-### `PUBLIC_BASE_URL` phải trỏ tới path tới được middleware
+### `PUBLIC_BASE_URL` tự suy ra, không cần cấu hình
 
-Link CV được ghép thành `{PUBLIC_BASE_URL}/cv/{id}`. Nếu path gốc (`/cv/...`) bị
-Nginx redirect sang Twenty thì link sẽ chết. Khi đó đặt `PUBLIC_BASE_URL` kèm
-prefix, ví dụ `https://stg-tinacrm.tinasoft.io/topcv` — catch-all sẽ phục vụ file
-dưới prefix đó. Kiểm tra bằng cách gọi `/health` rồi thử tải một link CV thật.
+Link CV phải là link **public**. Tên service docker (`http://topcv-ocr-middleware:8000`)
+chỉ resolve được bên trong docker network nên HR bên ngoài không mở được.
+
+Middleware tự dựng link từ chính request đến, nên cùng một image chạy được ở staging
+lẫn production mà không cần cấu hình riêng:
+
+| Nguồn | Lấy từ đâu |
+|---|---|
+| Scheme | `X-Forwarded-Proto`, rồi `request.url.scheme` |
+| Host | `X-Forwarded-Host`, rồi header `Host` |
+| Prefix | `X-Forwarded-Prefix`, rồi phần đường dẫn trước hậu tố `/webhook/topcv` |
+
+Ví dụ TopCV gửi tới `https://stg-tinacrm.tinasoft.io/topcv/webhook/topcv`, Nginx
+chuyển tiếp vào `/topcv/webhook/topcv` kèm `X-Forwarded-Proto: https` thì link sinh
+ra là `https://stg-tinacrm.tinasoft.io/topcv/cv/<id>` — public và giữ đúng prefix.
+
+`PUBLIC_BASE_URL` vẫn dùng được để ép một domain cụ thể, và sẽ thắng giá trị suy ra.
+**Để trống** trong `.env`, nếu không sẽ ghi đè lại thành URL nội bộ.
+
+`uvicorn` chạy với `--proxy-headers --forwarded-allow-ips=*` để tin các header trên.
+
+File CV được phục vụ dưới **mọi prefix** (`/cv/<id>`, `/topcv/cv/<id>`,
+`/api/v1/cv/<id>`), nên kể cả khi Nginx đặt service dưới prefix nào đó thì link vẫn
+gọi được.
 
 ## Link tải CV trong payload webhook
 
