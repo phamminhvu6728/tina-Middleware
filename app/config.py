@@ -11,5 +11,8 @@ class Settings(BaseModel):
     DEFAULT_PM_EMAIL: str = os.getenv("DEFAULT_PM_EMAIL", "tuyendung@tinasoft.vn")
     DOWNLOAD_TIMEOUT_SECONDS: int = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "30"))
     FORWARD_TIMEOUT_SECONDS: int = int(os.getenv("FORWARD_TIMEOUT_SECONDS", "30"))
+    PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "http://topcv-ocr-middleware:8000")
+    TMP_CV_DIR: str = os.getenv("TMP_CV_DIR", "/tmp/tina-middleware-cv")
+    CV_LINK_TTL_SECONDS: int = int(os.getenv("CV_LINK_TTL_SECONDS", "3600"))
 
 settings = Settings()

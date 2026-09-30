@@ -1,11 +1,6 @@
-version: '3.8'
-
 services:
   topcv-ocr-middleware:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: topcv-ocr-middleware:latest
+    image: ghcr.io/phamminhvu6728/tina-middleware:latest
     container_name: topcv-ocr-middleware
     restart: always
     ports:
@@ -15,8 +10,23 @@ services:
     environment:
       - PORT=8000
       - HOST=0.0.0.0
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://topcv-ocr-middleware:8000}
+      - TMP_CV_DIR=/var/lib/tina-middleware-cv
+      - CV_LINK_TTL_SECONDS=${CV_LINK_TTL_SECONDS:-3600}
+    volumes:
+      - cv-cache:/var/lib/tina-middleware-cv
+    networks:
+      - default
+      - tina-shared
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+networks:
+  tina-shared:
+    external: true
+
+volumes:
+  cv-cache:

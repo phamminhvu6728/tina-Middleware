@@ -25,7 +25,31 @@ TINA_WEBHOOK_URL=http://<IP_HOAC_DOMAIN_TINA_CRM>:3000/webhooks/workflows/5b8996
 DEFAULT_PM_EMAIL=tuyendung@tinasoft.vn
 DOWNLOAD_TIMEOUT_SECONDS=30
 FORWARD_TIMEOUT_SECONDS=30
+PUBLIC_BASE_URL=http://topcv-ocr-middleware:8000
+TMP_CV_DIR=/var/lib/tina-middleware-cv
+CV_LINK_TTL_SECONDS=3600
 ```
+
+### Bắt buộc: network chung `tina-shared`
+
+Link tải CV mà Tina CRM nhận trong webhook phải gọi được. Nếu middleware và
+Twenty nằm ở hai `docker-compose` riêng thì chúng **không gọi được nhau** (mỗi
+project tạo một network riêng). Cần một network chung, tạo **một lần**:
+```bash
+docker network create tina-shared
+```
+`docker-compose.yml` của middleware đã khai báo sẵn network này. **Phía Twenty
+cũng phải thêm** vào compose của họ:
+```yaml
+networks:
+  tina-shared:
+    external: true
+```
+Nếu Twenty chạy ngoài docker (VPS riêng), đổi `PUBLIC_BASE_URL` thành URL public
+thật, ví dụ `https://cv.tinasoft.vn`.
+
+Nếu Twenty gọi bằng địa chỉ IP container cứng (`172.19.0.2`) thì đừng làm vậy —
+IP đổi mỗi lần recreate container. Luôn dùng tên service.
 
 ### Bước 2: Khởi chạy container
 ```bash
@@ -93,14 +117,46 @@ Endpoint chính nhận webhook từ TopCV.
 }
 ```
 
-### 2. `POST /extract-url?url=<URL>`
+### 2. `GET /cv/{cv_id}`
+Tải file CV đã được cache. Link **có thời hạn ngắn** (`CV_LINK_TTL_SECONDS`,
+mặc định 1 giờ), sau đó file tự bị xóa và link trả `404`. Đây không phải kho lưu
+trữ lâu dài.
+
+Hỗ trợ `Range` request nên trình duyệt xem trước PDF không bị lỗi.
+
+### 3. `POST /cv/{cv_id}/release`
+Xóa file ngay lập tức, dùng khi bên nhận đã tải xong và muốn dọn file sớm.
+
+### 4. `POST /extract-url?url=<URL>`
 Test bóc tách text hoặc OCR từ một URL file bất kỳ.
 
-### 3. `POST /extract-file`
+### 5. `POST /extract-file`
 Upload file trực tiếp dạng `multipart/form-data` để test bóc tách.
 
-### 4. `GET /health`
-Kiểm tra trạng thái server và các engine OCR sẵn sàng.
+### 6. `GET /health`
+Kiểm tra trạng thái server, engine OCR và cấu hình link CV.
+
+---
+
+## Link tải CV trong payload webhook
+
+Link TopCV dạng `onetime-download` **hết hạn sau 24 giờ** (JWT `exp` trong token).
+Nên middleware không gửi link đó đi, mà tự cache file lại rồi gửi link của nó:
+
+```json
+{
+  "candidate_name": "Nguyễn Văn A",
+  "cv_text": "...",
+  "cv_file_url": "http://topcv-ocr-middleware:8000/cv/b3a8395e504b8520d89a19a8d433fc3b",
+  "cv_filename": "Nguyen-Van-A-TopCV.pdf",
+  "cv_size": 296332,
+  "cv_link_expires_at": "2026-09-30T13:15:00+07:00"
+}
+```
+
+Vòng đời: TopCV gửi webhook → middleware tải file ngay (token còn 24h nên thử lại
+được vô hạn lần) → cache tạm trên đĩa → gửi `cv_file_url` cho Tina CRM → file tự
+xoá khi hết TTL. Không dùng database, không lưu lâu dài.
 
 ---
 
